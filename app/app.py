@@ -1,35 +1,120 @@
-from fastapi import FastAPI, HTTPException
-
-app = FastAPI()
-
-# Handling text posts
-
-text_posts = {
-    1: {"title": "New Post", "content": "This is a test post"},
-    2: {"title": "FastAPI Intro", "content": "Learning how to build APIs with Python."},
-    3: {"title": "Python Tips", "content": "Use type hints for better code clarity."},
-    4: {"title": "Web Development", "content": "The frontend and backend must communicate via JSON."},
-    5: {"title": "Database Basics", "content": "SQL vs NoSQL: which one should you choose?"},
-    6: {"title": "Async Programming", "content": "Understanding await and async in FastAPI."},
-    7: {"title": "Deployment", "content": "How to deploy your app using Docker and Uvicorn."},
-    8: {"title": "Middleware", "content": "Adding custom headers to every response."},
-    9: {"title": "Security", "content": "Always hash your passwords before storing them."},
-    10: {"title": "Testing", "content": "Writing unit tests with Pytest for your endpoints."}
-}
+from fastapi import FastAPI, HTTPException, File, UploadFile, Form, Depends
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select
+from contextlib import asynccontextmanager
+# from imagekitio.models
+import shutil
+import tempfile
+import os
+import uuid
 
 
-@app.get("/posts")
-def get_all_post(limit: int = None): # Limit is an optional query parameter. Query parameters are the ones that appear after the '?'
-    if limit:
-        return list(text_posts.values())[:limit]
-    return text_posts
+from app.schemas import PostCreate
+from app.db import get_aysnc_session, create_db_and_tables
+from app.db import Post
+from app.images import imagekit
 
 
-@app.get("/posts/{id}")
-def get_post(id: int):
-    if id not in text_posts:
-        raise HTTPException(status_code=404, detail="Post not fo")
+async def lifespan(app: FastAPI):
+    await create_db_and_tables()
+    yield
 
-    return text_posts.get(id)
 
+
+app = FastAPI(lifespan=lifespan)
+
+
+@app.post("/upload")
+async def upload_file(
+    file: UploadFile = File(...),
+    caption: str = Form(""),
+    session: AsyncSession = Depends(get_aysnc_session)
+):
+    temp_file_path = None
+
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(file.filename)[1]) as temp_file:
+            temp_file_path = temp_file.name
+            shutil.copyfileobj(file.file, temp_file)
+
+
+        upload_result = imagekit.files.upload(
+            file = open(temp_file_path, 'rb'),
+            file_name = file.filename,
+            use_unique_file_name = True,
+            tags = ["backend-upload"]
+        )
+
+
+        post = Post(
+            caption = caption,
+            url = upload_result.url,
+            file_type = "video" if file.content_type.startswith("video/") else "photo",
+            file_name = upload_result.name
+        )
+
+        session.add(post)
+        await session.commit()
+        await session.refresh(post)
+
+        return post
+
+
+    except Exception as e:
+        print(str(e))
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+
+
+@app.get("/feed")
+async def get_feed(
+
+    session: AsyncSession = Depends(get_aysnc_session)
+):
+    result = await session.execute(select(Post).order_by(Post.created_at.desc()))
+
+    posts = []
+    for row in result.all():
+        posts.append(row[0])
+
+    posts_data = []
+    for post in posts:
+        posts_data.append(
+            {
+                "id": post.id,
+                "caption": post.caption, 
+                "url": post.url,
+                "file_type": post.file_type,
+                "file_name": post.file_name,
+                "created_at": post.created_at.isoformat()
+            }
+        )
+
+
+    return {"posts": posts_data}
+
+
+@app.delete("/delete-post/{post-id}")
+async def delete_post(post_id: str, session: AsyncSession = Depends(get_aysnc_session)):
+    try:
+        post_id = uuid.UUID(post_id)
+        result = await session.execute(select(Post).where(Post.id == post_id))
+        print(result)
+        post = result.scalars().first()
+
+        if not post:
+            raise HTTPException(status_code=404, detail="Post not found")
+
+        await session.delete(post)
+        await session.commit()
+
+        return {"success": True, "message": "Post deleted successfully"}
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+    
+
+    
 
